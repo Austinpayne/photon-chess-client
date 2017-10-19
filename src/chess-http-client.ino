@@ -83,7 +83,7 @@ int get_games() {
  */
 int get_first_game() {
     // can use iter interface to get first game
-    http_request_t request = {SERVER, PORT, "/games-needing-opponent-iter/0"};
+    http_request_t request = {SERVER, PORT, "/games/needing-opponent/0"};
     http.get(request, response, default_headers);
     return response.status;
 }
