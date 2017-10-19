@@ -290,6 +290,10 @@ void make_best_move() {
             if (http.ok(get_last_move(gid))) {
                 char *last_move = get_json_str(response.body, "{last_move:%Q}");
                 Log.info("updating board with last move...");
+                if (!last_move) {
+                    Log.error("couldn't get last_move!");
+                    return;
+                }
                 if (move_piece(last_move) != 0) {
                     Log.error("bot could not move piece!");
                     if (last_move) free(last_move);
