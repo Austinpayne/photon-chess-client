@@ -1,7 +1,7 @@
 #include <HttpClient.h>
 #include "frozen.h"
 
-#define TESTING
+//#define TESTING
 
 /*
  * chess-http-client
@@ -34,6 +34,11 @@ http_header_t default_headers[] = {
     { NULL } // always terminate headers with NULL
 };
 SerialLogHandler logHandler(LOG_LEVEL_INFO, {{"app", LOG_LEVEL_ALL}});
+
+// for direct control
+int mode = 0;
+TCPServer server = TCPServer(80);
+TCPClient client;
 
 /*
  *  validates that move is of the form:
@@ -153,6 +158,7 @@ int move(char *move) {
     if (PLAYER_TYPE == AI)
         Serial1.printf("%.4s", move);
     if (wait_for_board() == 0) {
+        Log.info("bot moved piece");
         post_move(gid, pid, move);
         return response.status;
     }
@@ -190,15 +196,20 @@ int wait_for_board() {
     return 0;
     #endif
     unsigned int timeout = millis() + 10000; // timeout after 10s
-    while (!Serial1.available()) {
-        Log.trace("waiting for board...");
-        delay(200); // wait
-        if (timeout > millis()) {
-            Log.error("timed out waiting for board");
-            return -1;
-        }
+    int avail = Serial1.available();
+    while (!avail) {
+        Log.trace("waiting for board... avail=%d", avail);
+        delay(1000); // wait
+        avail = Serial1.available();
+        //if (millis() > timeout) {
+        //    Log.error("timed out waiting for board");
+        //    return -1;
+        //}
     }
-    return Serial1.read();
+    int ret = Serial1.read();
+    Log.trace("avail=%d", avail);
+    Log.trace("Got %d from bot", ret);
+    return ret;
 }
 
 /*
@@ -222,30 +233,6 @@ int get_json_boolean(char *json, const char *fmt) {
     json_scanf(json, strlen(json), fmt, &b);
     Log.trace("got json boolean %d from %s", b, json);
     return b;
-}
-
-void init_serial(void) {
-    Serial.begin(9600);
-    Serial1.begin(9600);
-}
-
-void setup() {
-    init_serial();
-    WiFi.on(); // needed when in semi-automatic mode
-    WiFi.connect();
-    waitFor(WiFi.ready, 20000);
-    if (!WiFi.ready()) {
-        Log.error("could not connect to wifi!");
-        Log.error("stored networks:");
-        Log.error("ssid\tsecurity\tcipher\t");
-        WiFiAccessPoint ap[5];
-        int found = WiFi.getCredentials(ap, 5);
-        for (int i = 0; i < found; i++) {
-            Log.error("%s\t%s\t%s", ap[i].ssid, ap[i].security, ap[i].cipher);
-        }
-    } else {
-        Log.info("system ready");
-    }
 }
 
 void join_first_available_game() {
@@ -319,7 +306,66 @@ void make_best_move() {
     }
 }
 
+void init_serial(void) {
+    Serial.begin(9600);
+    Serial1.begin(9600);
+}
+
+int set_mode() {
+    unsigned int timeout = millis() + 5000; // timeout after 5
+    while (!Serial1.available()) {
+        Log.info("Send 1 for direct board control");
+        delay(1000); // wait
+        if (millis() > timeout) {
+            Log.info("Starting game mode");
+            return 0;
+        }
+    }
+    return Serial.read();
+}
+
+void setup() {
+    init_serial();
+    WiFi.on(); // needed when in semi-automatic mode
+    WiFi.connect();
+    mode = set_mode();
+    waitFor(WiFi.ready, 15000);
+    if (!WiFi.ready()) {
+        Log.error("could not connect to wifi!");
+        Log.error("stored networks:");
+        Log.error("ssid\tsecurity\tcipher\t");
+        WiFiAccessPoint ap[5];
+        int found = WiFi.getCredentials(ap, 5);
+        for (int i = 0; i < found; i++) {
+            Log.error("%s\t%s\t%s", ap[i].ssid, ap[i].security, ap[i].cipher);
+        }
+    } else {
+        Log.info("system ready");
+    }
+    if (mode == 1) { // direct control
+        server.begin();
+    }
+}
+
 void loop() {
+    if (mode == 1) { // direct control
+        if (client.connected()) {
+            while (client.available()) {
+                uint8_t temp_buffer[4];
+                int n;
+                n = client.read(temp_buffer, 4);
+                if (n == 4) {
+                    if (valid_move(temp_buffer, n)) {
+                        server.println("ok");
+                        Serial1.printf("%.4s", temp_buffer);
+                    } else {
+                        server.println("err");
+                    }
+                }
+            }
+        }
+        return;
+    }
     // have not joined game yet, join first available
     if (strlen(gid) == 0 || strlen(pid) == 0) {
         join_first_available_game();
