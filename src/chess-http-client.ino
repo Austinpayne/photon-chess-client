@@ -333,22 +333,28 @@ void setup() {
     if (!WiFi.ready()) {
         Log.error("could not connect to wifi!");
         Log.error("stored networks:");
-        Log.error("ssid\tsecurity\tcipher\t");
+        Log.error("ssid\tsecurity\tcipher");
         WiFiAccessPoint ap[5];
         int found = WiFi.getCredentials(ap, 5);
         for (int i = 0; i < found; i++) {
-            Log.error("%s\t%s\t%s", ap[i].ssid, ap[i].security, ap[i].cipher);
+            Serial.print(ap[i].ssid); Serial.print("\t");
+            Serial.print(ap[i].security); Serial.print("\t");
+            Serial.println(ap[i].cipher);
         }
     } else {
         Log.info("system ready");
+        Serial.println(WiFi.localIP());
+        Serial.println(WiFi.subnetMask());
+        Serial.println(WiFi.gatewayIP());
     }
+
     if (mode == 1) { // direct control
         server.begin();
     }
 }
 
 void loop() {
-    if (mode == 1) { // direct control
+    if (mode == 1) { // direct control via tcp 80
         if (client.connected()) {
             while (client.available()) {
                 uint8_t temp_buffer[4];
