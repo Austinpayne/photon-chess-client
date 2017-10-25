@@ -1,5 +1,6 @@
 #include <HttpClient.h>
 #include "frozen.h"
+#include "serial.h"
 
 //#define TESTING
 
@@ -149,14 +150,14 @@ int post_move(const char *game_id, const char *player_id, const char *move) {
 }
 
 int move_piece(char *move) {
-    Serial1.printf("%.4s", move);
+    Serial1.printlnf("%.4s", move);
     return wait_for_board();
 }
 
 int move(char *move) {
     // print 4 characters to chess robot
     if (PLAYER_TYPE == AI)
-        Serial1.printf("%.4s", move);
+        Serial1.printlnf("%.4s", move);
     if (wait_for_board() == 0) {
         Log.info("bot moved piece");
         post_move(gid, pid, move);
@@ -363,12 +364,15 @@ void loop() {
                 if (n == 4) {
                     if (valid_move(temp_buffer, n)) {
                         server.println("ok");
-                        Serial1.printf("%.4s", temp_buffer);
+                        Serial1.printlnf("%.4s", temp_buffer);
                     } else {
                         server.println("err");
                     }
                 }
             }
+        }
+        while (Serial1.available()) {
+            rx_serial_command();
         }
         return;
     }
