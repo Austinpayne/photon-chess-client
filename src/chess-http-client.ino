@@ -149,15 +149,15 @@ int post_move(const char *game_id, const char *player_id, const char *move) {
     return response.status;
 }
 
-int move_piece(char *move) {
-    Serial1.printlnf("%.4s", move);
+int move_piece(const char *move) {
+    send_move(move);
     return wait_for_board();
 }
 
-int move(char *move) {
+int move(const char *move) {
     // print 4 characters to chess robot
     if (PLAYER_TYPE == AI)
-        Serial1.printlnf("%.4s", move);
+        send_move(move);
     if (wait_for_board() == 0) {
         Log.info("bot moved piece");
         post_move(gid, pid, move);
@@ -364,7 +364,9 @@ void loop() {
                 if (n == 4) {
                     if (valid_move(temp_buffer, n)) {
                         server.println("ok");
-                        Serial1.printlnf("%.4s", temp_buffer);
+                        char move[5];
+                        snprintf(move, 5, "%.4s", temp_buffer);
+                        send_cmd(CMD_MOVE_PIECE, move);
                     } else {
                         server.println("err");
                     }

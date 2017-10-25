@@ -103,3 +103,11 @@ void rx_serial_command() {
         }
     }
 }
+
+void send_cmd(unsigned char cmd, const char *params) {
+    Serial1.printlnf("%d %s", cmd, params);
+}
+
+void send_move(const char *move) {
+    Serial1.printlnf("%d %.4s", CMD_MOVE_PIECE, move);
+}
