@@ -94,33 +94,36 @@ cmd_f cmds[] = {
     &do_set_wifi
 };
 
+// cmd format: `XXXX [params]\n`
+// or `XXXX\n`
 int do_serial_command(char *cmd_str) {
-    #define CMD_BITWIDTH 4
-
-    char cmd[CMD_BITWIDTH] = {0};
-    char params[] = {0};
-    int len = strlen(cmd_str);
-
-    if (len < CMD_BITWIDTH) {
-        Log.error("commands must be at least %d bits", CMD_BITWIDTH);
-        return -1;
-    }
-
-    strncpy(cmd, cmd_str, CMD_BITWIDTH);
-
-    Log.info("Got cmd %.4s", cmd);
-
-    int c = strtol(cmd, NULL, 2);
+    char *cmd, *params, *tmp;
+    int c;
     int ret = -1;
 
-    Log.info("cmd number: %d", c);
+    cmd = strtok(cmd_str, " \n");
+    params = strtok(NULL, "\n");
 
+    if (!cmd) {
+        Log.error("No command found");
+        goto done;
+    }
+    Log.info("Got cmd %.4s", cmd);
+
+    c = strtol(cmd, &tmp, 2);
+    if (strcmp(cmd, tmp) == 0) {
+        Log.error("Command bits are invalid");
+        goto done;
+    }
+
+    Log.info("cmd number: %d", c);
     if (c < sizeof(cmds) && cmds[c]) {
-        ret = cmds[c](cmd_str+CMD_BITWIDTH);
+        ret = cmds[c](params); // params may be NULL
     } else {
         Log.warn("Serial cmd %d not implemented", c);
     }
 
+done:
     return ret;
 }
 
