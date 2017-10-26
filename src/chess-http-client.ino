@@ -17,7 +17,6 @@ SYSTEM_THREAD(ENABLED); // run spark procs and application procs in parrallel
 #define PORT   3000
 #define RES_SIZE     1024
 #define HEADERS_SIZE 16
-#define COORD_VALID(c) ((c) < 8)
 #define AI 0
 #define HUMAN 1
 #define PLAYER_TYPE AI // TODO: should be selectable
@@ -38,26 +37,8 @@ SerialLogHandler logHandler(LOG_LEVEL_INFO, {{"app", LOG_LEVEL_ALL}});
 
 // for direct control
 int mode = 0;
-TCPServer server = TCPServer(80);
+TCPServer server = TCPServer(23);
 TCPClient client;
-
-/*
- *  validates that move is of the form:
- *      [a-h][1-8][a-h][1-8]
- */
-bool valid_move(uint8_t *move, size_t size) {
-    if (size == 4) {
-        unsigned char src_x, src_y, dst_x, dst_y;
-        src_x = move[0]-'a';
-	    src_y = move[1]-'1';
-	    dst_x = move[2]-'a';
-	    dst_y = move[3]-'1';
-	    return (COORD_VALID(src_x) && COORD_VALID(src_y) && COORD_VALID(dst_x) && COORD_VALID(dst_y));
-	    return false;
-    }
-
-    return false;
-}
 
 int join_game(const char *gid, const char *player_type) {
     char path[64], body[64];
@@ -313,8 +294,8 @@ void init_serial(void) {
 }
 
 int set_mode() {
-    unsigned int timeout = millis() + 5000; // timeout after 5
-    while (!Serial1.available()) {
+    unsigned int timeout = millis() + 10000; // timeout after 5
+    while (!Serial.available()) {
         Log.info("Send 1 for direct board control");
         delay(1000); // wait
         if (millis() > timeout) {
@@ -322,7 +303,9 @@ int set_mode() {
             return 0;
         }
     }
-    return Serial.read();
+    char c = Serial.read();
+    Log.info("Got %d", c);
+    return 1;
 }
 
 void setup() {
@@ -330,7 +313,7 @@ void setup() {
     WiFi.on(); // needed when in semi-automatic mode
     WiFi.connect();
     mode = set_mode();
-    waitFor(WiFi.ready, 15000);
+    waitFor(WiFi.ready, 10000);
     if (!WiFi.ready()) {
         Log.error("could not connect to wifi!");
         Log.error("stored networks:");
@@ -349,33 +332,20 @@ void setup() {
         Serial.println(WiFi.gatewayIP());
     }
 
-    if (mode == 1) { // direct control
+    if (mode == 1) {
+        Log.info("Starting direct control");
         server.begin();
     }
 }
 
 void loop() {
     if (mode == 1) { // direct control via tcp 80
-        if (client.connected()) {
-            while (client.available()) {
-                uint8_t temp_buffer[4];
-                int n;
-                n = client.read(temp_buffer, 4);
-                if (n == 4) {
-                    if (valid_move(temp_buffer, n)) {
-                        server.println("ok");
-                        char move[5];
-                        snprintf(move, 5, "%.4s", temp_buffer);
-                        send_cmd(CMD_MOVE_PIECE, move);
-                    } else {
-                        server.println("err");
-                    }
-                }
-            }
+        while (Serial.available()) {
+            direct_control();
         }
-        while (Serial1.available()) {
-            rx_serial_command();
-        }
+        //while (Serial1.available()) {
+        //    rx_serial_command();
+        //}
         return;
     }
     // have not joined game yet, join first available

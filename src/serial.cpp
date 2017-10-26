@@ -1,6 +1,7 @@
 #include "serial.h"
 
 #define SERIAL_BUFF_SIZE 64
+#define COORD_VALID(c) ((c) < 8)
 
 // serial buffers
 char rx_buffer[SERIAL_BUFF_SIZE];
@@ -28,6 +29,39 @@ int do_end_turn(char *params) {
     return -1;
 }
 
+/*
+ *  validates that move is of the form:
+ *      [a-h][1-8][a-h][1-8]
+ */
+bool valid_move(char *move, size_t size) {
+    if (size == 4) {
+        unsigned char src_x, src_y, dst_x, dst_y;
+        src_x = move[0]-'a';
+	    src_y = move[1]-'1';
+	    dst_x = move[2]-'a';
+	    dst_y = move[3]-'1';
+	    return (COORD_VALID(src_x) && COORD_VALID(src_y) && COORD_VALID(dst_x) && COORD_VALID(dst_y));
+	    return false;
+    }
+
+    return false;
+}
+
+int do_move_piece(char *params) {
+    char *p;
+    if ((p = strtok(params, ",")) != NULL) {
+        Log.trace("Got move: %s", p);
+        if (valid_move(p, 4)) {
+            Serial.println("move valid, sending");
+            send_cmd(CMD_MOVE_PIECE, params);
+        } else {
+            Serial.println("move invalid");
+        }
+        return 0;
+    }
+    return -1;
+}
+
 int do_promote(char *params) {
     Log.trace("Serial promote cmd not implemented");
     return -1;
@@ -52,7 +86,7 @@ cmd_f cmds[] = {
     &do_status,
     &do_new_game,
     &do_end_turn,
-    NULL, // move piece not supported on photon
+    &do_move_piece, // move piece not supported on photon, just for direct_control
     &do_promote,
     NULL, // calibrate not supported on photon
     &do_end_game,
@@ -74,8 +108,13 @@ int do_serial_command(char *cmd_str) {
 
     strncpy(cmd, cmd_str, CMD_BITWIDTH);
 
-    int c = atoi(cmd);
+    Log.info("Got cmd %.4s", cmd);
+
+    int c = strtol(cmd, NULL, 2);
     int ret = -1;
+
+    Log.info("cmd number: %d", c);
+
     if (c < sizeof(cmds) && cmds[c]) {
         ret = cmds[c](cmd_str+CMD_BITWIDTH);
     } else {
@@ -102,6 +141,36 @@ void rx_serial_command() {
             irx++;
         }
     }
+}
+
+void direct_control() {
+    #define BUFF_SIZE 32
+    #define CLEAR_BUFF memset(rx_buff, 0, BUFF_SIZE); i = 0
+
+    static char rx_buff[BUFF_SIZE];
+    static int i;
+
+    if (i < BUFF_SIZE) {
+        char c = Serial.read();
+        Serial.print(c);
+        if (c == '\r' || c == '\n') {
+            rx_buff[i] = '\0';
+            Serial.printlnf("Got %s", rx_buff);
+            if (do_serial_command(rx_buff) == 0) {
+                Log.trace("Serial cmd complete");
+            } else {
+                Log.error("Serial cmd failed");
+            }
+            CLEAR_BUFF;
+        } else {
+            rx_buff[i] = c;
+            i++;
+        }
+    } else {
+        CLEAR_BUFF;
+    }
+    #undef BUFF_SIZE
+    #undef CLEAR_BUFF
 }
 
 void send_cmd(unsigned char cmd, const char *params) {

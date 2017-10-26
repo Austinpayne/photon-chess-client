@@ -28,5 +28,6 @@ int do_serial_command(char *cmd_str);
 void rx_serial_command();
 void send_cmd(unsigned char cmd, const char *params);
 void send_move(const char *move);
+void direct_control();
 
 #endif /* __SERIAL_H_ */
