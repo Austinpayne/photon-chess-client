@@ -1,6 +1,6 @@
 #include <HttpClient.h>
+#include <serial.h>
 #include "frozen.h"
-#include "serial.h"
 
 //#define TESTING
 
@@ -40,7 +40,25 @@ int mode = 0;
 TCPServer server = TCPServer(23);
 TCPClient client;
 
-int join_game(const char *gid, const char *player_type) {
+int do_new_game(char *params) {
+    char body[64];
+
+    int ptype = atoi(params);
+    const char *player_type = ptype == AI ? "ai" : "human";
+    struct json_out out = JSON_OUT_BUF(body, sizeof(body));
+
+    json_printf(&out, "{player_type:%Q}", ptype);
+    http_request_t request = {SERVER, PORT, "/game", body};
+    http.post(request, response, default_headers);
+
+    if (http.ok(response.status)) {
+        set_gid_pid(response.body);
+        SEND_CMD(CMD_NEW_GAME);
+    }
+    return response.status;
+}
+
+int join_game(const char *gid, int player_type) {
     char path[64], body[64];
     // create json:
     // {"player_type":"ai"|"human", "opponent_type": "ai"|"human"}
@@ -131,14 +149,14 @@ int post_move(const char *game_id, const char *player_id, const char *move) {
 }
 
 int move_piece(const char *move) {
-    send_move(move);
+    SEND_MOVE(move);
     return wait_for_board();
 }
 
 int move(const char *move) {
     // print 4 characters to chess robot
     if (PLAYER_TYPE == AI)
-        send_move(move);
+        SEND_MOVE(move);
     if (wait_for_board() == 0) {
         Log.info("bot moved piece");
         post_move(gid, pid, move);
@@ -174,24 +192,23 @@ int set_gid_pid(char *gid_pid_json) {
  *  returns -1 if timeout, non-zero if fail, 0 if ok
  */
 int wait_for_board() {
-    #ifdef TESTING
-    return 0;
-    #endif
     unsigned int timeout = millis() + 10000; // timeout after 10s
-    int avail = Serial1.available();
-    while (!avail) {
-        Log.trace("waiting for board... avail=%d", avail);
-        delay(1000); // wait
-        avail = Serial1.available();
-        //if (millis() > timeout) {
-        //    Log.error("timed out waiting for board");
-        //    return -1;
-        //}
+    while (!Serial1.available()) {
+        delay(200); // wait
+        if (millis() > timeout) {
+            Log.error("timed out waiting for board");
+            return -1;
+        }
     }
-    int ret = Serial1.read();
-    Log.trace("avail=%d", avail);
-    Log.trace("Got %d from bot", ret);
-    return ret;
+
+    while (Serial1.available()) {
+        char c = Serial1.read();
+        Serial.print(c);
+        if (rx_serial_command(c) == 0)
+            break;
+    }
+
+    return 0;
 }
 
 /*
@@ -341,11 +358,15 @@ void setup() {
 void loop() {
     if (mode == 1) { // direct control via tcp 80
         while (Serial.available()) {
-            direct_control();
+            char c = Serial.read();
+            Serial.print(c);
+            rx_serial_command(c);
         }
-        //while (Serial1.available()) {
-        //    rx_serial_command();
-        //}
+        while (Serial1.available()) {
+            char c = Serial1.read();
+            Serial.print(c);
+            rx_serial_command(c);
+        }
         return;
     }
     // have not joined game yet, join first available
