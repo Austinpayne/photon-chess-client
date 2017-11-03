@@ -1,5 +1,6 @@
 #include <HttpClient.h>
 #include <serial.h>
+#include "serial_spark.h"
 #include "frozen.h"
 
 //#define TESTING
@@ -13,13 +14,15 @@ SYSTEM_MODE(SEMI_AUTOMATIC); // don't connect to Spark cloud until Particle.conn
 SYSTEM_THREAD(ENABLED); // run spark procs and application procs in parrallel
 
 //#define SERVER "172.16.93.61" // home
-#define SERVER "192.168.33.14"  // uknowthatsright
+//#define SERVER "192.168.33.14"  // uknowthatsright
+#define SERVER "192.168.1.134" // shl-w1
 #define PORT   3000
 #define RES_SIZE     1024
 #define HEADERS_SIZE 16
 #define AI 0
 #define HUMAN 1
 #define PLAYER_TYPE AI // TODO: should be selectable
+#define SERVER_RETRY 1000 // ms
 
 HttpClient http;
 char response_buffer[RES_SIZE];
@@ -41,7 +44,8 @@ TCPServer server = TCPServer(23);
 TCPClient client;
 
 int do_new_game(char *params) {
-    char body[64];
+    Log.info("starting new game");
+    /*char body[64];
 
     int ptype = atoi(params);
     const char *player_type = ptype == AI ? "ai" : "human";
@@ -52,10 +56,15 @@ int do_new_game(char *params) {
     http.post(request, response, default_headers);
 
     if (http.ok(response.status)) {
-        set_gid_pid(response.body);
+        set_gid_pid(response.body);*/
         SEND_CMD(CMD_NEW_GAME);
-    }
-    return response.status;
+        if (wait_for_board() == 0) {
+            Log.info("board calibrated and ready for new game");
+        }
+
+    /*}
+    return response.status;*/
+    return 0;
 }
 
 int join_game(const char *gid, int player_type) {
@@ -149,20 +158,29 @@ int post_move(const char *game_id, const char *player_id, const char *move) {
 }
 
 int move_piece(const char *move) {
-    SEND_MOVE(move);
-    return wait_for_board();
+    if (valid_move(move)) {
+        Log.info("move valid, sending %.4s", move);
+        SEND_MOVE(move);
+        if (wait_for_board() == 0) {
+            Log.info("board moved piece");
+            return 0;
+        }
+        Log.error("board failed to move piece");
+        return -1;
+    }
+    Log.error("move invalid");
+    return -1;
 }
 
 int move(const char *move) {
     // print 4 characters to chess robot
+    int piece_moved = -1;
     if (PLAYER_TYPE == AI)
-        SEND_MOVE(move);
-    if (wait_for_board() == 0) {
-        Log.info("bot moved piece");
+        piece_moved = move_piece(move);
+    if (piece_moved == 0) {
         post_move(gid, pid, move);
         return response.status;
     }
-    Log.error("could not make move");
     return -1;
 }
 
@@ -185,30 +203,6 @@ int set_gid_pid(char *gid_pid_json) {
     }
     Log.error("could not set gid and pid");
     return -1;
-}
-
-/*
- *  wait for '0' from board indicating "ok"
- *  returns -1 if timeout, non-zero if fail, 0 if ok
- */
-int wait_for_board() {
-    unsigned int timeout = millis() + 10000; // timeout after 10s
-    while (!Serial1.available()) {
-        delay(200); // wait
-        if (millis() > timeout) {
-            Log.error("timed out waiting for board");
-            return -1;
-        }
-    }
-
-    while (Serial1.available()) {
-        char c = Serial1.read();
-        Serial.print(c);
-        if (rx_serial_command(c) == 0)
-            break;
-    }
-
-    return 0;
 }
 
 /*
@@ -244,6 +238,12 @@ void join_first_available_game() {
         if (game_id && http.ok(join_game(game_id, PLAYER_TYPE))) {
             Log.info("joined game!");
             set_gid_pid(response.body);
+            int ready = -1;
+            while (ready != 0) {
+                SEND_CMD(CMD_NEW_GAME);
+                ready = wait_for_board();
+            }
+            Log.info("board calibrated and ready for new game");
         }
         if (game_id) free(game_id);
     } else {
@@ -251,7 +251,7 @@ void join_first_available_game() {
     }
 }
 
-int game_is_over(const char *game_id) {
+unsigned char game_is_over(const char *game_id) {
     if (http.ok(get_game_over(game_id))) {
         int game_over = get_json_boolean(response.body, "{game_over:%B}");
         if (game_over) {
@@ -275,23 +275,22 @@ void make_best_move() {
             // "show" other players move on board
             if (http.ok(get_last_move(gid))) {
                 char *last_move = get_json_str(response.body, "{last_move:%Q}");
-                Log.info("updating board with last move...");
                 if (!last_move) {
                     Log.error("couldn't get last_move!");
                     return;
                 }
-                if (move_piece(last_move) != 0) {
-                    Log.error("bot could not move piece!");
-                    if (last_move) free(last_move);
-                    return;
-                }
-                Log.info("piece moved!");
+                Log.info("updating board with last move...");
+                move_piece(last_move);
                 if (last_move) free(last_move);
             }
             Log.info("IT IS YOUR TURN! GO, GO, GO!");
             // get best move
             if (http.ok(get_bestmove(gid, pid))) {
                 char *bestmove = get_json_str(response.body, "{bestmove:%Q}");
+                if (!bestmove) {
+                    Log.error("couldn't get bestmove!");
+                    return;
+                }
                 Log.info("making bestmove");
                 move(bestmove);
                 if (bestmove) free(bestmove);
@@ -305,13 +304,8 @@ void make_best_move() {
     }
 }
 
-void init_serial(void) {
-    Serial.begin(9600);
-    Serial1.begin(9600);
-}
-
 int set_mode() {
-    unsigned int timeout = millis() + 10000; // timeout after 5
+    unsigned int timeout = millis() + 10000; // timeout after 10s
     while (!Serial.available()) {
         Log.info("Send 1 for direct board control");
         delay(1000); // wait
@@ -325,11 +319,23 @@ int set_mode() {
     return 1;
 }
 
+void direct_control() {
+    while (Serial.available()) { // read commands from direct control
+        char c = Serial.read();
+        Serial.print(c);
+        rx_serial_command(c, NULL);
+    }
+    while (Serial1.available()) { // read commands from stm32
+        char c = Serial1.read();
+        rx_serial_command(c, NULL);
+    }
+}
+
 void setup() {
     init_serial();
     WiFi.on(); // needed when in semi-automatic mode
     WiFi.connect();
-    mode = set_mode();
+    mode = set_mode(); // send 1 for direct control
     waitFor(WiFi.ready, 10000);
     if (!WiFi.ready()) {
         Log.error("could not connect to wifi!");
@@ -351,22 +357,15 @@ void setup() {
 
     if (mode == 1) {
         Log.info("Starting direct control");
-        server.begin();
     }
+
+    while (Serial.read() >= 0); // flush any data in read buffer
+    while (Serial1.read() >= 0);
 }
 
 void loop() {
-    if (mode == 1) { // direct control via tcp 80
-        while (Serial.available()) {
-            char c = Serial.read();
-            Serial.print(c);
-            rx_serial_command(c);
-        }
-        while (Serial1.available()) {
-            char c = Serial1.read();
-            Serial.print(c);
-            rx_serial_command(c);
-        }
+    if (mode == 1) {
+        direct_control();
         return;
     }
     // have not joined game yet, join first available
@@ -383,5 +382,5 @@ void loop() {
         make_best_move();
     }
 
-    delay(1000); // check every 1 seconds
+    delay(SERVER_RETRY);
 }
