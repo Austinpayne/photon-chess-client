@@ -2,6 +2,7 @@
 #include <frozen.h>
 #include <serial.h>
 #include "serial_spark.h"
+#include "chess-client.h"
 
 //#define TESTING
 
@@ -13,10 +14,8 @@
 SYSTEM_MODE(SEMI_AUTOMATIC); // don't connect to Spark cloud until Particle.connect()
 SYSTEM_THREAD(ENABLED); // run spark procs and application procs in parrallel
 
-//#define SERVER "172.16.93.61" // home
-//#define SERVER "192.168.33.14"  // uknowthatsright
-#define SERVER "192.168.1.134" // shl-w1
-#define PORT   3000
+#define SERVER "174.52.149.107"
+#define PORT   30300
 #define RES_SIZE     1024
 #define HEADERS_SIZE 16
 #define AI 0
@@ -36,36 +35,11 @@ http_header_t default_headers[] = {
     { "Cache-Control", "no-cache"},
     { NULL } // always terminate headers with NULL
 };
-SerialLogHandler logHandler(LOG_LEVEL_INFO, {{"app", LOG_LEVEL_ALL}});
+SerialLogHandler logHandler(LOG_LEVEL_INFO, {{"app", LOG_LEVEL_ALL}, {"app.m0", LOG_LEVEL_ALL}});
+char console_serial_buffer[SERIAL_BUFF_SIZE];
+char stm_serial_buffer[SERIAL_BUFF_SIZE];
 
-// for direct control
 int mode = 0;
-TCPServer server = TCPServer(23);
-TCPClient client;
-
-int do_new_game(char *params) {
-    Log.info("starting new game");
-    /*char body[64];
-
-    int ptype = atoi(params);
-    const char *player_type = ptype == AI ? "ai" : "human";
-    struct json_out out = JSON_OUT_BUF(body, sizeof(body));
-
-    json_printf(&out, "{player_type:%Q}", ptype);
-    http_request_t request = {SERVER, PORT, "/game", body};
-    http.post(request, response, default_headers);
-
-    if (http.ok(response.status)) {
-        set_gid_pid(response.body);*/
-        SEND_CMD(CMD_NEW_GAME);
-        if (wait_for_board() == 0) {
-            Log.info("board calibrated and ready for new game");
-        }
-
-    /*}
-    return response.status;*/
-    return 0;
-}
 
 int join_game(const char *gid, int player_type) {
     char path[64], body[64];
@@ -157,11 +131,27 @@ int post_move(const char *game_id, const char *player_id, const char *move) {
     return response.status;
 }
 
-int move_piece(const char *move) {
+int move_piece(const char *color, const char *move, const char *flags, const char *extra) {
+    char fmt[32] = "%.4s";
     if (valid_move(move)) {
         Log.info("move valid, sending %.4s", move);
-        SEND_MOVE(move);
-        if (wait_for_board() == 0) {
+        SEND_CMD_START(CMD_MOVE_PIECE, "%.4s", move);
+
+        if (flags && color) {
+            SEND_CMD_PARAM("%.2s%.1s", flags, color);
+        } else if (flags && !color) {
+            SEND_CMD_PARAM("%.2s", flags);
+        } else if (!flags && color) {
+            SEND_CMD_PARAM("%.1s", color);
+        }
+        if (extra) {
+            SEND_CMD_PARAM("%.4s", extra);
+        }
+
+        SEND_CMD_END();
+
+        int expected = CMD_STATUS;
+        if (wait_for_board(&expected) == 0) {
             Log.info("board moved piece");
             return 0;
         }
@@ -172,16 +162,45 @@ int move_piece(const char *move) {
     return -1;
 }
 
-int move(const char *move) {
-    // print 4 characters to chess robot
-    int piece_moved = -1;
-    if (PLAYER_TYPE == AI)
-        piece_moved = move_piece(move);
-    if (piece_moved == 0) {
-        post_move(gid, pid, move);
-        return response.status;
+int move(const char *color, const char *move, const char *flags) {
+    int ret;
+    char *extra;
+    char serial_flags[3]; // max 2 flags (pc)
+    if (!move) {
+        Log.error("couldn't get move!");
+        return -1;
     }
-    return -1;
+    if (flags) {
+        int i = 0;
+        if (strchr(flags, 'c')) { // capture
+            serial_flags[i++] = 'c';
+        }
+
+        // only one of the following flags can be set at a time
+        // but p and c can be set together (pawn capture into final rank)
+        if (strchr(flags, 'k') || strchr(flags, 'q')) { // castling
+            extra = get_json_str(response.body, "{extra_move:%Q}");
+            serial_flags[i++] = 'k';
+        } else if (strchr(flags, 'e')) { // en passant
+            extra = get_json_str(response.body, "{en_passant:%Q}");
+            serial_flags[i++] = 'e';
+        } else if (strchr(flags, 'p')) { // promote
+            extra = get_json_str(response.body, "{promotion:%Q}");
+            serial_flags[i++] = 'p';
+        }
+
+        serial_flags[i] = '\0';
+    }
+    Log.info("updating board with move %s", move);
+    ret = move_piece(color, move, flags, extra);
+    if (extra) free(extra);
+    return ret;
+}
+
+int clear_gid_pid() {
+    memset(gid, 0, sizeof(gid));
+    memset(pid, 0, sizeof(pid));
+    return 0;
 }
 
 /*
@@ -241,7 +260,8 @@ void join_first_available_game() {
             int ready = -1;
             while (ready != 0) {
                 SEND_CMD(CMD_NEW_GAME);
-                ready = wait_for_board();
+                int expected = CMD_STATUS;
+                ready = wait_for_board(&expected);
             }
             Log.info("board calibrated and ready for new game");
         }
@@ -273,27 +293,35 @@ void make_best_move() {
         int my_turn = get_json_boolean(response.body, "{turn:%B}");
         if (my_turn) {
             // "show" other players move on board
+            char *fmt = "{move:%Q, flags%Q, color:%Q}";
+            char *mv, *flags, *color;
             if (http.ok(get_last_move(gid))) {
-                char *last_move = get_json_str(response.body, "{last_move:%Q}");
-                if (!last_move) {
-                    Log.error("couldn't get last_move!");
-                    return;
-                }
-                Log.info("updating board with last move...");
-                move_piece(last_move);
-                if (last_move) free(last_move);
+                char serial_flags[3];
+                json_scanf(response.body, strlen(response.body), fmt, &mv, &flags, &color);
+                move(color, mv, flags);
+                if (mv)    free(mv);
+                if (flags) free(flags);
+                if (color) free(color);
             }
             Log.info("IT IS YOUR TURN! GO, GO, GO!");
             // get best move
-            if (http.ok(get_bestmove(gid, pid))) {
-                char *bestmove = get_json_str(response.body, "{bestmove:%Q}");
-                if (!bestmove) {
-                    Log.error("couldn't get bestmove!");
-                    return;
+            if (PLAYER_TYPE == AI && http.ok(get_bestmove(gid, pid))) {
+                json_scanf(response.body, strlen(response.body), fmt, &mv, &flags, &color);
+                if (move(color, mv, flags) == 0)
+                    post_move(gid, pid, mv);
+                if (mv)    free(mv);
+                if (flags) free(flags);
+                if (color) free(color);
+            } else if (PLAYER_TYPE == HUMAN) {
+                // TODO: wait for move from board
+                // also need to check move object returned from server
+                // and undo any invalid moves
+                int expected = CMD_MOVE_PIECE;
+                wait_for_board(&expected);
+                while (expected == 99) { // invalid move, try again
+                    expected = CMD_MOVE_PIECE;
+                    wait_for_board(&expected);
                 }
-                Log.info("making bestmove");
-                move(bestmove);
-                if (bestmove) free(bestmove);
             }
         } else {
             // make sure board state is same, if not move board
@@ -307,7 +335,7 @@ void make_best_move() {
 int set_mode() {
     unsigned int timeout = millis() + 10000; // timeout after 10s
     while (!Serial.available()) {
-        Log.info("Send 1 for direct board control");
+        Log.info("Press any key for direct board control");
         delay(1000); // wait
         if (millis() > timeout) {
             Log.info("Starting game mode");
@@ -315,7 +343,6 @@ int set_mode() {
         }
     }
     char c = Serial.read();
-    Log.info("Got %d", c);
     return 1;
 }
 
@@ -323,11 +350,12 @@ void direct_control() {
     while (Serial.available()) { // read commands from direct control
         char c = Serial.read();
         Serial.print(c);
-        rx_serial_command(c, NULL);
+        if (c != 127) // backspace
+            rx_serial_command_r(c, console_serial_buffer, SERIAL_BUFF_SIZE, NULL);
     }
     while (Serial1.available()) { // read commands from stm32
         char c = Serial1.read();
-        rx_serial_command(c, NULL);
+        rx_serial_command_r(c, stm_serial_buffer, SERIAL_BUFF_SIZE, NULL);
     }
 }
 
@@ -375,8 +403,7 @@ void loop() {
     // game joined, make best move while game is not over and it is your turn
     else {
         if (game_is_over(gid)) {
-            memset(gid, 0, sizeof(gid));
-            memset(pid, 0, sizeof(pid));
+            clear_gid_pid();
             return;
         }
         make_best_move();

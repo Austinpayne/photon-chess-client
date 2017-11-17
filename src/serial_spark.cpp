@@ -1,18 +1,46 @@
 #ifdef SPARK
-#include "Particle.h"
-#include "serial.h"
+#include <Particle.h>
+#include <frozen.h>
+#include <serial.h>
 #include "serial_spark.h"
+#include "chess-client.h"
 
 void init_serial(void) {
     Serial.begin(9600);
     Serial1.begin(9600);
 }
 
+int do_new_game(char *params) {
+    Log.info("starting new game");
+    /*char body[64];
+
+    int ptype = atoi(params);
+    const char *player_type = ptype == AI ? "ai" : "human";
+    struct json_out out = JSON_OUT_BUF(body, sizeof(body));
+
+    json_printf(&out, "{player_type:%Q}", ptype);
+    http_request_t request = {SERVER, PORT, "/game", body};
+    http.post(request, response, default_headers);
+
+    if (http.ok(response.status)) {
+        set_gid_pid(response.body);*/
+        SEND_CMD(CMD_NEW_GAME);
+        int expected = CMD_STATUS;
+        if (wait_for_board(&expected) == 0){
+            Log.info("board calibrated and ready for new game");
+        }
+
+
+    /*}
+    return response.status;*/
+    return 0;
+}
+
 /*
  *  wait for '0' from board indicating "ok"
  *  returns -1 if timeout, non-zero if fail, 0 if ok
  */
-int wait_for_board() {
+int wait_for_board(int *expected) {
     unsigned int timeout = millis() + BOARD_TIMEOUT; // timeout after 10s
     while (!Serial1.available()) {
         if (millis() > timeout) {
@@ -27,18 +55,25 @@ int wait_for_board() {
     delay(10);
 
     char rx_buffer[SERIAL_BUFF_SIZE];
-    int expected = CMD_STATUS;
     int status;
-    while (Serial1.available()) {
-        char c = Serial1.read();
-        status = rx_serial_command_r(c, rx_buffer, SERIAL_BUFF_SIZE, &expected);
-        if (status == 0) {
-            if (expected == OKAY)
-                return 0;
-            break;
+    int orig_expected = *expected;
+    timeout = millis() + BOARD_TIMEOUT;
+    while (millis() < timeout) {
+        if (Serial1.available()) {
+            char c = Serial1.read();
+            status = rx_serial_command_r(c, rx_buffer, SERIAL_BUFF_SIZE, expected);
+            if (status == 0) {
+                if (*expected == -1) {
+                    // keep waiting
+                    *expected = orig_expected; // need to restore if command was different
+                } else {
+                    return 0;
+                }
+            }
         }
     }
 
+    Log.error("timed out waiting for board");
     return -1;
 }
 
@@ -64,21 +99,38 @@ bool valid_move(const char *move) {
     return false;
 }
 
-// only for testing, captures a move command from usb serial
-// and forwards it to motor driver
 int do_move_piece(char *params) {
-    if (valid_move(params)) {
-        Log.info("move valid, sending %.4s", params);
-        SEND_MOVE(params);
-        if (wait_for_board() == 0) {
+    if (mode == 1) { // direct control
+        Log.info("sending %s", params);
+        SEND_CMD_P(CMD_MOVE_PIECE, "%s", params); // forward to M0
+        int expected = CMD_STATUS;
+        if (wait_for_board(&expected) == 0) {
             Log.info("board moved piece");
             return 0;
         }
         Log.error("board failed to move piece");
         return -1;
+    } else {
+        if (valid_move(params)) {
+            if (http.ok(post_move(gid, pid, params))) {
+                int err = 0;
+                json_scanf(response.body, strlen(response.body), "{err_code:%d}", &err);
+                if (err = 99) { // invalid move
+                    char undo_move[5];
+                    undo_move[0] = params[2];
+                    undo_move[1] = params[3];
+                    undo_move[2] = params[0];
+                    undo_move[3] = params[1];
+                    undo_move[0] = '\0';
+                    SEND_CMD_P(CMD_MOVE_PIECE, "%.4s", params);
+                    return err;
+                }
+                return 0;
+            }
+            Log.error("Failed to post move");
+            return -1;
+        }
     }
-    Log.error("move invalid");
-    return -1;
 }
 
 int do_promote(char *params) {
@@ -95,6 +147,31 @@ int do_calibrate(char *params) {
 int do_end_game(char *params) {
     Log.trace("Serial end game cmd not implemented");
     return -1;
+}
+
+int do_send_log(char *params) {
+    #define MAX_PARAMS 1
+    char *p_arr[MAX_PARAMS];
+    int num_params = parse_params(params, p_arr, MAX_PARAMS);
+    if (num_params != 1)
+        return -1;
+    Logger m0_log("app.m0");
+    int lvl = atoi(p_arr[0]);
+    switch (lvl) {
+        case LVL_TRACE:
+            m0_log.trace("%s", params+2);
+            break;
+        case LVL_INFO:
+            m0_log.info("%s", params+2);
+            break;
+        case LVL_WARN:
+            m0_log.warn("%s", params+2);
+            break;
+        case LVL_ERR:
+            m0_log.error("%s", params+2);
+            break;
+    }
+    return 0;
 }
 
 int do_scan_wifi(char *params) {
