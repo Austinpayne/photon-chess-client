@@ -131,21 +131,19 @@ int post_move(const char *game_id, const char *player_id, const char *move) {
     return response.status;
 }
 
-int move_piece(const char *color, const char *move, const char *flags, const char *extra) {
+int move_piece(const char *move, const char *flags, const char *extra) {
     char fmt[32] = "%.4s";
     if (valid_move(move)) {
         Log.info("move valid, sending %.4s", move);
         SEND_CMD_START(CMD_MOVE_PIECE, "%.4s", move);
 
-        if (flags && color) {
-            SEND_CMD_PARAM("%.2s%.1s", flags, color);
-        } else if (flags && !color) {
-            SEND_CMD_PARAM("%.2s", flags);
-        } else if (!flags && color) {
-            SEND_CMD_PARAM("%.1s", color);
+        if (flags) {
+            Log.info("flags %.4s", flags);
+            SEND_CMD_PARAM("%.4s", flags);
         }
         if (extra) {
-            SEND_CMD_PARAM("%.4s", extra);
+            Log.info("extra %s", extra);
+            SEND_CMD_PARAM("%s", extra);
         }
 
         SEND_CMD_END();
@@ -164,8 +162,8 @@ int move_piece(const char *color, const char *move, const char *flags, const cha
 
 int move(const char *color, const char *move, const char *flags) {
     int ret;
-    char *extra;
-    char serial_flags[3]; // max 2 flags (pc)
+    char *extra = NULL;
+    char serial_flags[4]; // max 2 flags (pc)
     if (!move) {
         Log.error("couldn't get move!");
         return -1;
@@ -174,8 +172,8 @@ int move(const char *color, const char *move, const char *flags) {
         int i = 0;
         if (strchr(flags, 'c')) { // capture
             serial_flags[i++] = 'c';
+            if (color) serial_flags[i++] = *color;
         }
-
         // only one of the following flags can be set at a time
         // but p and c can be set together (pawn capture into final rank)
         if (strchr(flags, 'k') || strchr(flags, 'q')) { // castling
@@ -184,6 +182,7 @@ int move(const char *color, const char *move, const char *flags) {
         } else if (strchr(flags, 'e')) { // en passant
             extra = get_json_str(response.body, "{en_passant:%Q}");
             serial_flags[i++] = 'e';
+            if (color) serial_flags[i++] = *color;
         } else if (strchr(flags, 'p')) { // promote
             extra = get_json_str(response.body, "{promotion:%Q}");
             serial_flags[i++] = 'p';
@@ -192,7 +191,7 @@ int move(const char *color, const char *move, const char *flags) {
         serial_flags[i] = '\0';
     }
     Log.info("updating board with move %s", move);
-    ret = move_piece(color, move, flags, extra);
+    ret = move_piece(move, serial_flags, extra);
     if (extra) free(extra);
     return ret;
 }
@@ -293,7 +292,7 @@ void make_best_move() {
         int my_turn = get_json_boolean(response.body, "{turn:%B}");
         if (my_turn) {
             // "show" other players move on board
-            char *fmt = "{move:%Q, flags%Q, color:%Q}";
+            char *fmt = "{move:%Q, flags:%Q, color:%Q}";
             char *mv, *flags, *color;
             if (http.ok(get_last_move(gid))) {
                 char serial_flags[3];
