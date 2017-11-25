@@ -25,10 +25,11 @@ int do_new_game(char *params) {
     if (http.ok(response.status)) {
         set_gid_pid(response.body);*/
         SEND_CMD(CMD_NEW_GAME);
-        int expected = CMD_STATUS;
-        if (wait_for_board(&expected) == 0){
-            Log.info("board calibrated and ready for new game");
+        while (wait_for_board(CMD_STATUS) != STATUS_OKAY){
+            Log.error("board failed to start new game, trying again...");
+            SEND_CMD(CMD_NEW_GAME);
         }
+        Log.info("board calibrated and ready for new game");
 
 
     /*}
@@ -40,7 +41,7 @@ int do_new_game(char *params) {
  *  wait for '0' from board indicating "ok"
  *  returns -1 if timeout, non-zero if fail, 0 if ok
  */
-int wait_for_board(int *expected) {
+int wait_for_board(int expected) {
     unsigned int timeout = millis() + BOARD_TIMEOUT; // timeout after 10s
     while (!Serial1.available()) {
         if (millis() > timeout) {
@@ -55,21 +56,26 @@ int wait_for_board(int *expected) {
     delay(10);
 
     char rx_buffer[SERIAL_BUFF_SIZE];
-    int status;
-    int orig_expected = *expected;
+    int cmd;
+    int *cmd_ret;
     timeout = millis() + BOARD_TIMEOUT;
     while (millis() < timeout) {
         if (Serial1.available()) {
             char c = Serial1.read();
-            status = rx_serial_command_r(c, rx_buffer, SERIAL_BUFF_SIZE, expected);
-            if (status == 0) {
-                if (*expected == -1) {
-                    // keep waiting
-                    *expected = orig_expected; // need to restore if command was different
-                } else {
-                    return 0;
+            cmd = rx_serial_command_r(c, rx_buffer, SERIAL_BUFF_SIZE, cmd_ret);
+            if (cmd == -1) {
+                // keep rx'ing bytes
+            } else if (cmd == expected) {
+                if (*cmd_ret < 0) { // param parsing error
+                    Log.error("command %d failed to parse parameters, cmd_ret=%d", *cmd_ret);
+                    return -1;
                 }
+                return *cmd_ret;
+            } else if (cmd == -2) {
+                Log.error("serial failed to rx command with error %d", cmd);
+                return -1;
             }
+            // else rx'd different command
         }
     }
 
@@ -103,13 +109,12 @@ int do_move_piece(char *params) {
     if (mode == 1) { // direct control
         Log.info("sending %s", params);
         SEND_CMD_P(CMD_MOVE_PIECE, "%s", params); // forward to M0
-        int expected = CMD_STATUS;
-        if (wait_for_board(&expected) == 0) {
-            Log.info("board moved piece");
-            return 0;
+        while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
+            Log.error("board failed to move piece, trying again...");
+            SEND_CMD_P(CMD_MOVE_PIECE, "%s", params);
         }
-        Log.error("board failed to move piece");
-        return -1;
+        Log.info("board moved piece");
+        return 0;
     } else {
         if (valid_move(params)) {
             if (http.ok(post_move(gid, pid, params))) {

@@ -148,13 +148,11 @@ int move_piece(const char *move, const char *flags, const char *extra) {
 
         SEND_CMD_END();
 
-        int expected = CMD_STATUS;
-        if (wait_for_board(&expected) == 0) {
-            Log.info("board moved piece");
-            return 0;
+        while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
+            Log.error("board failed to move piece, trying again");
         }
-        Log.error("board failed to move piece");
-        return -1;
+        Log.info("board moved piece");
+        return 0;
     }
     Log.error("move invalid");
     return -1;
@@ -256,11 +254,10 @@ void join_first_available_game() {
         if (game_id && http.ok(join_game(game_id, PLAYER_TYPE))) {
             Log.info("joined game!");
             set_gid_pid(response.body);
-            int ready = -1;
-            while (ready != 0) {
+            SEND_CMD(CMD_NEW_GAME);
+            while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
+                Log.error("board failed to start new game, trying again...");
                 SEND_CMD(CMD_NEW_GAME);
-                int expected = CMD_STATUS;
-                ready = wait_for_board(&expected);
             }
             Log.info("board calibrated and ready for new game");
         }
@@ -315,11 +312,9 @@ void make_best_move() {
                 // TODO: wait for move from board
                 // also need to check move object returned from server
                 // and undo any invalid moves
-                int expected = CMD_MOVE_PIECE;
-                wait_for_board(&expected);
-                while (expected == 99) { // invalid move, try again
-                    expected = CMD_MOVE_PIECE;
-                    wait_for_board(&expected);
+                while (wait_for_board(CMD_MOVE_PIECE) == 99) {
+                    // invalid move, try again
+                    Log.error("invalid human move, waiting for different move...");
                 }
             }
         } else {
