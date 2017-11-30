@@ -12,29 +12,34 @@ void init_serial(void) {
 
 int do_new_game(char *params) {
     Log.info("starting new game");
-    /*char body[64];
+    int num_params;
+    char *p_arr[2] = {NULL};
 
-    int ptype = atoi(params);
-    const char *player_type = ptype == AI ? "ai" : "human";
-    struct json_out out = JSON_OUT_BUF(body, sizeof(body));
+	num_params = parse_params(params, p_arr, 2);
 
-    json_printf(&out, "{player_type:%Q}", ptype);
-    http_request_t request = {SERVER, PORT, "/game", body};
-    http.post(request, response, default_headers);
-
-    if (http.ok(response.status)) {
-        set_gid_pid(response.body);*/
+    SEND_CMD(CMD_NEW_GAME);
+    while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
+        Log.error("board failed to start new game, trying again...");
         SEND_CMD(CMD_NEW_GAME);
-        while (wait_for_board(CMD_STATUS) != STATUS_OKAY){
-            Log.error("board failed to start new game, trying again...");
-            SEND_CMD(CMD_NEW_GAME);
+    }
+    Log.info("board calibrated and ready for new game");
+
+    if (num_params > 1) {
+        player_type = *(p_arr[0]) == AI ? AI : HUMAN;
+        if (player_type == HUMAN) {
+            const char *opponent_type = *(p_arr[1]) == AI ? "ai" : "human";
+
+            if (http.ok(create_new_game("human", opponent_type))) {
+                set_gid_pid(response.body, "{id:%Q, player1:{id:%Q}}");
+                return 0;
+            }
+            Log.error("failed to post new game");
+        } else if (player_type == AI) {
+            join_first_available_game();
+            return 0;
         }
-        Log.info("board calibrated and ready for new game");
-
-
-    /*}
-    return response.status;*/
-    return 0;
+    }
+    return -1;
 }
 
 /*
@@ -42,11 +47,14 @@ int do_new_game(char *params) {
  *  returns -1 if timeout, non-zero if fail, 0 if ok
  */
 int wait_for_board(int expected) {
+    #define DONE(r) do {ret = (r); goto out;} while(0)
+    int ret = -1;
+    waiting_for_board = true;
     unsigned int timeout = millis() + BOARD_TIMEOUT; // timeout after 10s
     while (!Serial1.available()) {
         if (millis() > timeout) {
             Log.error("timed out waiting for board");
-            return -1;
+            DONE(-1);
         }
     }
 
@@ -57,35 +65,40 @@ int wait_for_board(int expected) {
 
     char rx_buffer[SERIAL_BUFF_SIZE];
     int cmd;
-    int *cmd_ret;
+    int cmd_ret;
     timeout = millis() + BOARD_TIMEOUT;
     while (millis() < timeout) {
         if (Serial1.available()) {
             char c = Serial1.read();
-            cmd = rx_serial_command_r(c, rx_buffer, SERIAL_BUFF_SIZE, cmd_ret);
-            if (cmd == -1) {
+            cmd = rx_serial_command_r(c, rx_buffer, SERIAL_BUFF_SIZE, &cmd_ret);
+            if (cmd == CONTINUE) {
                 // keep rx'ing bytes
             } else if (cmd == expected) {
-                if (*cmd_ret < 0) { // param parsing error
-                    Log.error("command %d failed to parse parameters, cmd_ret=%d", *cmd_ret);
-                    return -1;
+                if (cmd_ret < 0) { // param parsing error
+                    Log.error("command %d failed to parse parameters, cmd_ret=%d", cmd_ret);
+                    DONE(-1);
                 }
-                return *cmd_ret;
-            } else if (cmd == -2) {
+                DONE(cmd_ret);
+            } else if (cmd == FAIL) {
                 Log.error("serial failed to rx command with error %d", cmd);
-                return -1;
+                DONE(-1);
             }
             // else rx'd different command
         }
     }
 
-    Log.error("timed out waiting for board");
-    return -1;
+out:
+    waiting_for_board = false;
+    return ret;
 }
 
 int do_end_turn(char *params) {
-    Log.trace("Serial end turn cmd not implemented");
-    return -1;
+    // just forward to M0
+    if (params)
+        SEND_CMD_P(CMD_END_TURN, "%s", params);
+    else
+        SEND_CMD(CMD_END_TURN);
+    return 0;
 }
 
 /*
@@ -130,11 +143,13 @@ int do_move_piece(char *params) {
                     SEND_CMD_P(CMD_MOVE_PIECE, "%.4s", params);
                     return err;
                 }
+                player_turn = false;
                 return 0;
             }
             Log.error("Failed to post move");
             return -1;
         }
+        return 99;
     }
 }
 
@@ -150,8 +165,8 @@ int do_calibrate(char *params) {
 }
 
 int do_end_game(char *params) {
-    Log.trace("Serial end game cmd not implemented");
-    return -1;
+    clear_gid_pid();
+    return 0;
 }
 
 int do_send_log(char *params) {
@@ -176,6 +191,18 @@ int do_send_log(char *params) {
             m0_log.error("%s", params+2);
             break;
     }
+    return 0;
+}
+
+// params:
+//      c = capture
+//      k = castle
+int do_capture_castle(char *params) {
+    // just forward to M0
+    if (params)
+        SEND_CMD_P(CMD_CAPTURE_CASTLE, "%s", params);
+    else
+        SEND_CMD(CMD_CAPTURE_CASTLE);
     return 0;
 }
 
