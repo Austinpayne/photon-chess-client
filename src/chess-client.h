@@ -15,7 +15,7 @@ extern char gid[48];
 extern char pid[48];
 extern char player_type;
 extern bool player_turn;
-extern bool waiting_for_board;
+extern bool waiting_for_user;
 
 int post_move(const char *game_id, const char *player_id, const char *move);
 int set_gid_pid(char *gid_pid_json, const char *fmt);

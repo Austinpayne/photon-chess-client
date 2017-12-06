@@ -1,44 +1,58 @@
 #ifdef SPARK
 #include <Particle.h>
 #include <frozen.h>
-#include <serial.h>
 #include "serial_spark.h"
 #include "chess-client.h"
 
+char stm_serial_buffer[SERIAL_BUFF_SIZE];
+int stm_save_i = 0;
+
 void init_serial(void) {
-    Serial.begin(9600);
+    MAIN_SERIAL.begin(9600);
     Serial1.begin(9600);
 }
 
+/*
+ *  param0 (player_type): ['h'|'a']?
+ *  param1 (opponent_type): ['h'|'a']?
+ *  default game (i.e. no params): player = HUMAN, opponent = AI
+ */
 int do_new_game(char *params) {
-    Log.info("starting new game");
+    LOG_INFO("starting new game");
     int num_params;
-    char *p_arr[2] = {NULL};
-
+    char *p_arr[2];
 	num_params = parse_params(params, p_arr, 2);
 
+    player_type = HUMAN;
+    char opponent_type = AI;
+    switch(num_params) {
+        case 2:
+            opponent_type = (*(p_arr[1]) == HUMAN) ? HUMAN : AI;
+        /* FALLTHROUGH */
+        case 1:
+            player_type = (*(p_arr[0]) == AI) ? AI : HUMAN;
+            break;
+    }
+
     SEND_CMD(CMD_NEW_GAME);
+    LOG_TRACE("sent new game commnd");
     while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
-        Log.error("board failed to start new game, trying again...");
+        LOG_ERR("board failed to start new game, trying again...");
         SEND_CMD(CMD_NEW_GAME);
     }
-    Log.info("board calibrated and ready for new game");
+    LOG_INFO("board calibrated and ready for new game");
 
-    if (num_params > 1) {
-        player_type = *(p_arr[0]) == AI ? AI : HUMAN;
-        if (player_type == HUMAN) {
-            const char *opponent_type = *(p_arr[1]) == AI ? "ai" : "human";
-
-            if (http.ok(create_new_game("human", opponent_type))) {
-                set_gid_pid(response.body, "{id:%Q, player1:{id:%Q}}");
-                return 0;
-            }
-            Log.error("failed to post new game");
-        } else if (player_type == AI) {
-            join_first_available_game();
+    if (player_type == HUMAN) {
+        if (http.ok(create_new_game("human", opponent_type == HUMAN ? "human" : "ai"))) {
+            set_gid_pid(response.body, "{id:%Q, player1:{id:%Q}}");
             return 0;
         }
+        LOG_ERR("failed to post new game");
+    } else {
+        join_first_available_game();
+        return 0;
     }
+
     return -1;
 }
 
@@ -47,49 +61,44 @@ int do_new_game(char *params) {
  *  returns -1 if timeout, non-zero if fail, 0 if ok
  */
 int wait_for_board(int expected) {
-    #define DONE(r) do {ret = (r); goto out;} while(0)
-    int ret = -1;
-    waiting_for_board = true;
     unsigned int timeout = millis() + BOARD_TIMEOUT; // timeout after 10s
     while (!Serial1.available()) {
         if (millis() > timeout) {
-            Log.error("timed out waiting for board");
-            DONE(-1);
+            LOG_ERR("timed out waiting for board");
+            return -1;
         }
     }
 
     // (austin) WAR: with some delay, Serial1.available() returns the proper
-    // number of bytes the board sent. Without the delay, Serial.available()
+    // number of bytes the board sent. Without the delay, MAIN_SERIAL.available()
     // only returns 1 byte and fails...
     delay(10);
 
-    char rx_buffer[SERIAL_BUFF_SIZE];
     int cmd;
     int cmd_ret;
     timeout = millis() + BOARD_TIMEOUT;
     while (millis() < timeout) {
         if (Serial1.available()) {
             char c = Serial1.read();
-            cmd = rx_serial_command_r(c, rx_buffer, SERIAL_BUFF_SIZE, &cmd_ret);
+            cmd = rx_serial_command_r(c, stm_serial_buffer, &stm_save_i, SERIAL_BUFF_SIZE, &cmd_ret);
             if (cmd == CONTINUE) {
                 // keep rx'ing bytes
             } else if (cmd == expected) {
                 if (cmd_ret < 0) { // param parsing error
-                    Log.error("command %d failed to parse parameters, cmd_ret=%d", cmd_ret);
-                    DONE(-1);
+                    LOG_ERR("command %d failed to parse parameters, cmd_ret=%d", cmd_ret);
+                    return -1;
                 }
-                DONE(cmd_ret);
+                LOG_TRACE("got %d bytes from stm32", cmd_ret);
+                return cmd_ret;
             } else if (cmd == FAIL) {
-                Log.error("serial failed to rx command with error %d", cmd);
-                DONE(-1);
+                LOG_ERR("serial failed to rx command with error %d", cmd);
+                return -1;
             }
             // else rx'd different command
         }
     }
 
-out:
-    waiting_for_board = false;
-    return ret;
+    return -1;
 }
 
 int do_end_turn(char *params) {
@@ -98,6 +107,15 @@ int do_end_turn(char *params) {
         SEND_CMD_P(CMD_END_TURN, "%s", params);
     else
         SEND_CMD(CMD_END_TURN);
+
+    while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
+        if (params)
+            SEND_CMD_P(CMD_END_TURN, "%s", params);
+        else
+            SEND_CMD(CMD_END_TURN);
+    }
+
+    waiting_for_user = false;
     return 0;
 }
 
@@ -120,13 +138,22 @@ bool valid_move(const char *move) {
 
 int do_move_piece(char *params) {
     if (mode == 1) { // direct control
-        Log.info("sending %s", params);
+        LOG_INFO("sending %s", params);
         SEND_CMD_P(CMD_MOVE_PIECE, "%s", params); // forward to M0
-        while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
-            Log.error("board failed to move piece, trying again...");
-            SEND_CMD_P(CMD_MOVE_PIECE, "%s", params);
+        while (1) {
+            int status = wait_for_board(CMD_STATUS);
+            LOG_TRACE("status=%d", status);
+            if (status == STATUS_OKAY) {
+                break;
+            } else if (status == STATUS_FAIL) {
+                LOG_ERR("move invalid");
+                return -1;
+            } else {
+                LOG_ERR("board failed to move piece, trying again...");
+                SEND_CMD_P(CMD_MOVE_PIECE, "%s", params);
+            }
         }
-        Log.info("board moved piece");
+        LOG_INFO("board moved piece");
         return 0;
     } else {
         if (valid_move(params)) {
@@ -143,10 +170,9 @@ int do_move_piece(char *params) {
                     SEND_CMD_P(CMD_MOVE_PIECE, "%.4s", params);
                     return err;
                 }
-                player_turn = false;
                 return 0;
             }
-            Log.error("Failed to post move");
+            LOG_ERR("Failed to post move");
             return -1;
         }
         return 99;
@@ -154,18 +180,19 @@ int do_move_piece(char *params) {
 }
 
 int do_promote(char *params) {
-    Log.trace("Serial promote cmd not implemented");
+    LOG_TRACE("Serial promote cmd not implemented");
     return -1;
 }
 
 int do_calibrate(char *params) {
-    Log.trace("Calibrating");
+    LOG_TRACE("Calibrating");
     SEND_CMD(CMD_CALIBRATE);
     return 0;
 }
 
 int do_end_game(char *params) {
     clear_gid_pid();
+    // send end game to server
     return 0;
 }
 
@@ -194,25 +221,39 @@ int do_send_log(char *params) {
     return 0;
 }
 
-// params:
-//      c = capture
-//      k = castle
-int do_capture_castle(char *params) {
-    // just forward to M0
-    if (params)
-        SEND_CMD_P(CMD_CAPTURE_CASTLE, "%s", params);
-    else
-        SEND_CMD(CMD_CAPTURE_CASTLE);
-    return 0;
-}
-
 int do_scan_wifi(char *params) {
-    Log.trace("Serial scan wifi cmd not implemented");
+    LOG_TRACE("Serial scan wifi cmd not implemented");
     return -1;
 }
 
 int do_set_wifi(char *params) {
-    Log.trace("Serial set wifi cmd not implemented");
+    LOG_TRACE("Serial set wifi cmd not implemented");
+    return -1;
+}
+
+/*
+ *  param0: ['c'|'k']
+ */
+int do_capture_castle(char *params) {
+    // just forward to M0
+    if (params)
+        SEND_CMD_P(CMD_CAPTURE_CASTLE, "%s", params);
+    else // default capture
+        SEND_CMD_P(CMD_CAPTURE_CASTLE, "%s", "c");
+    return 0;
+}
+
+/*
+ *  resets stm32 then photon
+ */
+int do_reset(char *params) {
+    SEND_CMD(CMD_RESET);
+    delay(500);
+    System.reset();
+    return 0;
+}
+
+int do_user_turn(char *params) {
     return -1;
 }
 #endif

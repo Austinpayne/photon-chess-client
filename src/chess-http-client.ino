@@ -1,6 +1,6 @@
 #include <HttpClient.h>
 #include <frozen.h>
-#include <serial.h>
+#include "Serial2/Serial2.h"
 #include "serial_spark.h"
 #include "chess-client.h"
 
@@ -10,7 +10,6 @@
  * Date: 10/01/2017
  */
 SYSTEM_MODE(SEMI_AUTOMATIC); // don't connect to Spark cloud until Particle.connect()
-SYSTEM_THREAD(ENABLED); // run spark procs and application procs in parrallel
 
 #define RES_SIZE     1024
 #define HEADERS_SIZE 16
@@ -30,11 +29,10 @@ http_header_t default_headers[] = {
 // logging
 SerialLogHandler logHandler(LOG_LEVEL_INFO, {{"app", LOG_LEVEL_ALL}, {"app.m0", LOG_LEVEL_ALL}});
 // timer to check for commands from android
-Timer serial_timer(1000, check_serial);
 
 // serial buffers
 char console_serial_buffer[SERIAL_BUFF_SIZE]; // android
-char stm_serial_buffer[SERIAL_BUFF_SIZE]; // stm32
+int console_save_i;
 
 // global gid, pid
 char gid[48] = {0};
@@ -42,7 +40,7 @@ char pid[48] = {0};
 // global flags
 char player_type = HUMAN;
 bool player_turn = false;
-bool waiting_for_board = false;
+bool waiting_for_user = false;
 int mode = 0;
 
 /*
@@ -132,7 +130,7 @@ int check_turn(const char *game_id, const char *player_id) {
     if (http.ok(response.status)) {
         return get_json_boolean(response.body, "{turn:%B}");
     } else {
-        Log.error("could not get turn, response.status=%d", response.status);
+        LOG_ERR("could not get turn, response.status=%d", response.status);
         return -1;
     }
 }
@@ -149,7 +147,7 @@ int game_is_over(const char *game_id) {
     if (http.ok(response.status)) {
         return get_json_boolean(response.body, "{game_over:%B}");
     } else {
-        Log.error("could not check if game is over, response.status=%d", response.status);
+        LOG_ERR("could not check if game is over, response.status=%d", response.status);
         return -1;
     }
 }
@@ -175,7 +173,7 @@ int post_move(const char *game_id, const char *player_id, const char *move) {
     struct json_out out = JSON_OUT_BUF(body, sizeof(body));
     json_printf(&out, "{move:%Q}", move);
 
-    Log.info("posting move with body: %s", body);
+    LOG_INFO("posting move with body: %s", body);
 
     snprintf(path, 128, "/game/%s/player/%s/move", game_id, player_id);
     http_request_t request = {SERVER, PORT, path, body};
@@ -187,14 +185,15 @@ int post_move(const char *game_id, const char *player_id, const char *move) {
  *  sends move to stm32 via serial
  */
 void send_move(const char *move, const char *flags, const char *extra) {
+    LOG_INFO("move valid, sending %.4s", move);
     SEND_CMD_START(CMD_MOVE_PIECE, "%.4s", move);
 
-    if (flags) {
-        Log.info("flags %.4s", flags);
+    if (strlen(flags) != 0) {
+        LOG_INFO("flags %.4s", flags);
         SEND_CMD_PARAM("%.4s", flags);
     }
     if (extra) {
-        Log.info("extra %s", extra);
+        LOG_INFO("extra %s", extra);
         SEND_CMD_PARAM("%s", extra);
     }
 
@@ -205,18 +204,17 @@ void send_move(const char *move, const char *flags, const char *extra) {
  *  if mvoe is valid, send it to stm32
  */
 int move_piece(const char *move, const char *flags, const char *extra) {
-    char fmt[32] = "%.4s";
     if (valid_move(move)) {
-        Log.info("move valid, sending %.4s", move);
         send_move(move, flags, extra);
         while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
-            Log.error("board failed to move piece, trying again");
+            LOG_ERR("board failed to move piece, trying again");
             send_move(move, flags, extra);
         }
-        Log.info("board moved piece");
+        player_turn = false;
+        LOG_INFO("board moved piece");
         return 0;
     }
-    Log.error("move invalid");
+    LOG_ERR("move invalid");
     return -1;
 }
 
@@ -227,15 +225,16 @@ int move(const char *color, const char *move, const char *flags) {
     int ret;
     char *extra = NULL;
     char serial_flags[4]; // max 2 flags (pc)
+    bool set_color = false;
     if (!move) {
-        Log.error("couldn't get move!");
+        LOG_ERR("couldn't get move!");
         return -1;
     }
     if (flags) {
         int i = 0;
         if (strchr(flags, 'c')) { // capture
             serial_flags[i++] = 'c';
-            if (color) serial_flags[i++] = *color;
+            set_color = true;
         }
         // only one of the following flags can be set at a time
         // but p and c can be set together (pawn capture into final rank)
@@ -245,15 +244,21 @@ int move(const char *color, const char *move, const char *flags) {
         } else if (strchr(flags, 'e')) { // en passant
             extra = get_json_str(response.body, "{en_passant:%Q}");
             serial_flags[i++] = 'e';
-            if (color) serial_flags[i++] = *color;
+            set_color = true;
         } else if (strchr(flags, 'p')) { // promote
             extra = get_json_str(response.body, "{promotion:%Q}");
             serial_flags[i++] = 'p';
+            set_color = true;
+        }
+
+        // need color for capture or promotion
+        if (set_color && color) {
+            serial_flags[i++] = *color;
         }
 
         serial_flags[i] = '\0';
     }
-    Log.info("updating board with move %s", move);
+    LOG_INFO("updating board with move %s", move);
     ret = move_piece(move, serial_flags, extra);
     if (extra) free(extra);
     return ret;
@@ -263,6 +268,7 @@ int move(const char *color, const char *move, const char *flags) {
  *  clears global pid and pid
  */
 int clear_gid_pid() {
+    waiting_for_user = false;
     player_turn = false;
     memset(gid, 0, sizeof(gid));
     memset(pid, 0, sizeof(pid));
@@ -279,16 +285,16 @@ int set_gid_pid(char *gid_pid_json, const char *fmt) {
     char *player_id = NULL;
     json_scanf(gid_pid_json, strlen(gid_pid_json), fmt, &joined_game_id, &player_id);
     if (joined_game_id && player_id) {
-        Log.trace("got gid: %s  and pid:%s from %s", joined_game_id, player_id, gid_pid_json);
+        LOG_TRACE("got gid: %s  and pid:%s from %s", joined_game_id, player_id, gid_pid_json);
         strcpy(gid, joined_game_id);
         strcpy(pid, player_id);
-        Log.info("game id: %s", gid);
-        Log.info("your player id: %s", pid);
+        LOG_INFO("game id: %s", gid);
+        LOG_INFO("your player id: %s", pid);
         free(joined_game_id);
         free(player_id);
         return 0;
     }
-    Log.error("could not set gid and pid");
+    LOG_ERR("could not set gid and pid");
     return -1;
 }
 
@@ -300,7 +306,7 @@ int set_gid_pid(char *gid_pid_json, const char *fmt) {
 char *get_json_str(char *json, const char *fmt) {
     char *str = NULL;
     json_scanf(json, strlen(json), fmt, &str);
-    Log.trace("got json string %s from %s", str, json);
+    LOG_TRACE("got json string %s from %s", str, json);
     return str;
 }
 
@@ -311,7 +317,7 @@ char *get_json_str(char *json, const char *fmt) {
 int get_json_boolean(char *json, const char *fmt) {
     int b = 0;
     json_scanf(json, strlen(json), fmt, &b);
-    Log.trace("got json boolean %d from %s", b, json);
+    LOG_TRACE("got json boolean %d from %s", b, json);
     return b;
 }
 
@@ -321,27 +327,30 @@ int get_json_boolean(char *json, const char *fmt) {
  */
 void join_first_available_game() {
     while(1) {
-        Log.info("attempting to join first available game...");
+        LOG_INFO("attempting to join first available game...");
         // get first available game
         if (http.ok(get_first_game())) {
             char *game_id = get_json_str(response.body, "{id:%Q}");
-            Log.info("joining game %s", game_id);
+            LOG_INFO("joining game %s", game_id);
             // join game
             if (game_id && http.ok(join_game(game_id, player_type))) {
-                Log.info("joined game!");
+                LOG_INFO("joined game!");
                 set_gid_pid(response.body, "{id:%Q, player2:{id:%Q}}");
                 SEND_CMD(CMD_NEW_GAME);
                 while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
-                    Log.error("board failed to start new game, trying again...");
+                    LOG_ERR("board failed to start new game, trying again...");
                     SEND_CMD(CMD_NEW_GAME);
                 }
-                Log.info("board calibrated and ready for new game");
+                LOG_INFO("board calibrated and ready for new game");
+                if (game_id) free(game_id);
                 return;
             }
             if (game_id) free(game_id);
         } else {
-            Log.error("could not get first available game, response.status=%d", response.status);
+            LOG_ERR("could not get first available game, response.status=%d", response.status);
         }
+
+        delay(SERVER_RETRY);
     }
 }
 
@@ -351,10 +360,10 @@ void join_first_available_game() {
  */
 void print_game_result(const char *game_id) {
     if (http.ok(get_game_result(game_id))) {
-        Log.info("%s", response.body);
+        LOG_INFO("%s", response.body);
     }
     // clear gid and pid so client can start another game
-    Log.info("game is over, please join another game");
+    LOG_INFO("game is over, please join another game");
 }
 
 /*
@@ -365,7 +374,7 @@ void print_game_result(const char *game_id) {
  *      c. if player_type is HUMAN, waits for end turn from android
  */
 void move_loop() {
-    Log.info("checking turn...");
+    LOG_INFO("checking turn...");
     int my_turn = check_turn(gid, pid);
     if (my_turn > 0) {
         // "show" other players move on board
@@ -378,9 +387,10 @@ void move_loop() {
             if (mv)    free(mv);
             if (flags) free(flags);
             if (color) free(color);
+            SEND_ANDROID_CMD(CMD_USER_TURN);
         }
         player_turn = true;
-        Log.info("IT IS YOUR TURN! GO, GO, GO!");
+        LOG_INFO("IT IS YOUR TURN! GO, GO, GO!");
         // get best move
         if (player_type == AI && http.ok(get_bestmove(gid, pid))) {
             json_scanf(response.body, strlen(response.body), fmt, &mv, &flags, &color);
@@ -391,9 +401,10 @@ void move_loop() {
             if (color) free(color);
         } else if (player_type == HUMAN) {
             // wait for player_turn flag
+            waiting_for_user = true;
         }
     } else if (my_turn == 0) {
-        Log.info("not your turn, waiting...");
+        LOG_INFO("not your turn, waiting...");
     }
 }
 
@@ -403,16 +414,14 @@ void move_loop() {
 int set_mode() {
     int seconds = 10;
     unsigned int timeout = millis() + seconds*1000; // timeout after 10s
-    while (!Serial.available()) {
-        Log.info("Press any key for direct board control %d", seconds);
+    while (!MAIN_SERIAL.available()) {
+        LOG_INFO("Press any key for direct board control %d", seconds);
         delay(1000); // wait
-        if (millis() > timeout) {
-            Log.info("Starting game mode");
+        if (millis() > timeout)
             return 0;
-        }
         seconds -= 1;
     }
-    char c = Serial.read();
+    char c = MAIN_SERIAL.read();
     return 1;
 }
 
@@ -420,16 +429,13 @@ int set_mode() {
  *  check for serial commands from android and stm32
  */
 void check_serial() {
-    while (Serial.available()) { // read commands from android
-        char c = Serial.read();
+    int cmd;
+    while (MAIN_SERIAL.available()) { // read commands from android
+        char c = MAIN_SERIAL.read();
         if (mode == 1)
-            Serial.print(c);
+            MAIN_SERIAL.print(c);
         if (c != 127) // backspace
-            rx_serial_command_r(c, console_serial_buffer, SERIAL_BUFF_SIZE, NULL);
-    }
-    while (!waiting_for_board && Serial1.available()) { // read commands from stm32
-        char c = Serial1.read();
-        rx_serial_command_r(c, stm_serial_buffer, SERIAL_BUFF_SIZE, NULL);
+            cmd = rx_serial_command_r(c, console_serial_buffer, &console_save_i, SERIAL_BUFF_SIZE, NULL);
     }
 }
 
@@ -440,40 +446,46 @@ void setup() {
     mode = set_mode(); // send 1 for direct control
     waitFor(WiFi.ready, 10000);
     if (!WiFi.ready()) {
-        Log.error("could not connect to wifi!");
-        Log.error("stored networks:");
-        Log.error("ssid\tsecurity\tcipher");
+        LOG_ERR("could not connect to wifi!");
+        LOG_ERR("stored networks:");
+        LOG_ERR("ssid\tsecurity\tcipher");
         WiFiAccessPoint ap[5];
         int found = WiFi.getCredentials(ap, 5);
         for (int i = 0; i < found; i++) {
-            Serial.print(ap[i].ssid); Serial.print("\t");
-            Serial.print(ap[i].security); Serial.print("\t");
-            Serial.println(ap[i].cipher);
+            MAIN_SERIAL.print(ap[i].ssid); MAIN_SERIAL.print("\t");
+            MAIN_SERIAL.print(ap[i].security); MAIN_SERIAL.print("\t");
+            MAIN_SERIAL.println(ap[i].cipher);
         }
     } else {
-        Log.info("system ready");
-        Serial.println(WiFi.localIP());
-        Serial.println(WiFi.subnetMask());
-        Serial.println(WiFi.gatewayIP());
+        LOG_INFO("system ready");
+        IPAddress ip = WiFi.localIP();
+        LOG_INFO("IP: %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+        ip = WiFi.subnetMask();
+        LOG_INFO("Subnet: %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+        ip = WiFi.gatewayIP();
+        LOG_INFO("Gateway: %u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
     }
 
     if (mode == 1) {
-        Log.info("Starting direct control");
+        LOG_INFO("Starting direct control");
+    } else {
+        LOG_INFO("Starting game mode");
     }
 
-    while (Serial.read() >= 0); // flush any data in read buffer
+    while (MAIN_SERIAL.read() >= 0); // flush any data in read buffers
     while (Serial1.read() >= 0);
-    serial_timer.start();
 }
 
 void loop() {
     if (mode == 1) {
         // direct control
+        check_serial();
         return;
     }
 
     if (strlen(gid) == 0 || strlen(pid) == 0) {
         // waiting to start new game
+        check_serial();
         return;
     }
     // main game loop
@@ -481,6 +493,8 @@ void loop() {
     else if (game_is_over(gid)) {
         print_game_result(gid);
         clear_gid_pid();
+    } else if (waiting_for_user) {
+        check_serial();
     } else {
         move_loop();
     }
