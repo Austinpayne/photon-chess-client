@@ -26,8 +26,6 @@ http_header_t default_headers[] = {
     { "Cache-Control", "no-cache"},
     { NULL } // always terminate headers with NULL
 };
-// logging
-SerialLogHandler logHandler(LOG_LEVEL_INFO, {{"app", LOG_LEVEL_ALL}, {"app.m0", LOG_LEVEL_ALL}});
 // timer to check for commands from android
 
 // serial buffers
@@ -40,7 +38,6 @@ char pid[48] = {0};
 // global flags
 char player_type = HUMAN;
 bool player_turn = false;
-bool waiting_for_user = false;
 int mode = 0;
 
 /*
@@ -201,16 +198,16 @@ void send_move(const char *move, const char *flags, const char *extra) {
 }
 
 /*
- *  if mvoe is valid, send it to stm32
+ *  if move is valid, send it to stm32
  */
 int move_piece(const char *move, const char *flags, const char *extra) {
     if (valid_move(move)) {
         send_move(move, flags, extra);
-        while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
-            LOG_ERR("board failed to move piece, trying again");
-            send_move(move, flags, extra);
+        for (int i=0; i<2; i++) {
+            if (wait_for_board(CMD_STATUS, BOARD_TIMEOUT) == STATUS_OKAY) {
+                break;
+            }
         }
-        player_turn = false;
         LOG_INFO("board moved piece");
         return 0;
     }
@@ -268,7 +265,6 @@ int move(const char *color, const char *move, const char *flags) {
  *  clears global pid and pid
  */
 int clear_gid_pid() {
-    waiting_for_user = false;
     player_turn = false;
     memset(gid, 0, sizeof(gid));
     memset(pid, 0, sizeof(pid));
@@ -337,7 +333,7 @@ void join_first_available_game() {
                 LOG_INFO("joined game!");
                 set_gid_pid(response.body, "{id:%Q, player2:{id:%Q}}");
                 SEND_CMD(CMD_NEW_GAME);
-                while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
+                while (wait_for_board(CMD_STATUS, BOARD_TIMEOUT) != STATUS_OKAY) {
                     LOG_ERR("board failed to start new game, trying again...");
                     SEND_CMD(CMD_NEW_GAME);
                 }
@@ -361,6 +357,7 @@ void join_first_available_game() {
 void print_game_result(const char *game_id) {
     if (http.ok(get_game_result(game_id))) {
         LOG_INFO("%s", response.body);
+        SEND_ANDROID_CMD(2);
     }
     // clear gid and pid so client can start another game
     LOG_INFO("game is over, please join another game");
@@ -381,17 +378,21 @@ void move_loop() {
         char *fmt = "{move:%Q, flags:%Q, color:%Q}";
         char *mv, *flags, *color;
         if (!player_turn && http.ok(get_last_move(gid))) {
-            char serial_flags[3];
-            json_scanf(response.body, strlen(response.body), fmt, &mv, &flags, &color);
-            move(color, mv, flags);
-            if (mv)    free(mv);
-            if (flags) free(flags);
-            if (color) free(color);
-            SEND_ANDROID_CMD(CMD_USER_TURN);
+            int err = 0;
+            json_scanf(response.body, strlen(response.body), "{err_code:%d}", &err);
+            if (err == 98) {
+                LOG_INFO("no last move... setting player_turn");
+            } else {
+                char serial_flags[3];
+                json_scanf(response.body, strlen(response.body), fmt, &mv, &flags, &color);
+                move(color, mv, flags);
+                if (mv)    free(mv);
+                if (flags) free(flags);
+                if (color) free(color);
+            }
         }
-        player_turn = true;
-        LOG_INFO("IT IS YOUR TURN! GO, GO, GO!");
-        // get best move
+
+        // get best move if AI
         if (player_type == AI && http.ok(get_bestmove(gid, pid))) {
             json_scanf(response.body, strlen(response.body), fmt, &mv, &flags, &color);
             if (move(color, mv, flags) == 0)
@@ -401,7 +402,9 @@ void move_loop() {
             if (color) free(color);
         } else if (player_type == HUMAN) {
             // wait for player_turn flag
-            waiting_for_user = true;
+            player_turn = true;
+            SEND_ANDROID_CMD(CMD_USER_TURN);
+            LOG_INFO("IT IS YOUR TURN! GO, GO, GO!");
         }
     } else if (my_turn == 0) {
         LOG_INFO("not your turn, waiting...");
@@ -412,7 +415,7 @@ void move_loop() {
  *  set direct control at bootup
  */
 int set_mode() {
-    int seconds = 10;
+    int seconds = 5;
     unsigned int timeout = millis() + seconds*1000; // timeout after 10s
     while (!MAIN_SERIAL.available()) {
         LOG_INFO("Press any key for direct board control %d", seconds);
@@ -493,9 +496,10 @@ void loop() {
     else if (game_is_over(gid)) {
         print_game_result(gid);
         clear_gid_pid();
-    } else if (waiting_for_user) {
-        check_serial();
     } else {
+        while (player_turn) {
+            check_serial();
+        }
         move_loop();
     }
 

@@ -36,20 +36,14 @@ int do_new_game(char *params) {
 
     SEND_CMD(CMD_NEW_GAME);
     LOG_TRACE("sent new game commnd");
-    while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
+    while (wait_for_board(CMD_STATUS, QUICK_TIMEOUT) != STATUS_OKAY) {
         LOG_ERR("board failed to start new game, trying again...");
         SEND_CMD(CMD_NEW_GAME);
     }
-    LOG_INFO("board calibrated and ready for new game");
+    LOG_INFO("board calibrated and ready for new game %c vs %c", player_type, opponent_type);
 
-    if (player_type == HUMAN) {
-        if (http.ok(create_new_game("human", opponent_type == HUMAN ? "human" : "ai"))) {
-            set_gid_pid(response.body, "{id:%Q, player1:{id:%Q}}");
-            return 0;
-        }
-        LOG_ERR("failed to post new game");
-    } else {
-        join_first_available_game();
+    if (http.ok(create_new_game(player_type == HUMAN ? "human" : "ai", opponent_type == HUMAN ? "human" : "ai"))) {
+        set_gid_pid(response.body, "{id:%Q, player1:{id:%Q}}");
         return 0;
     }
 
@@ -60,8 +54,8 @@ int do_new_game(char *params) {
  *  wait for '0' from board indicating "ok"
  *  returns -1 if timeout, non-zero if fail, 0 if ok
  */
-int wait_for_board(int expected) {
-    unsigned int timeout = millis() + BOARD_TIMEOUT; // timeout after 10s
+int wait_for_board(int expected, unsigned int tout) {
+    unsigned int timeout = millis() + tout; // timeout after 10s
     while (!Serial1.available()) {
         if (millis() > timeout) {
             LOG_ERR("timed out waiting for board");
@@ -76,7 +70,7 @@ int wait_for_board(int expected) {
 
     int cmd;
     int cmd_ret;
-    timeout = millis() + BOARD_TIMEOUT;
+    timeout = millis() + tout;
     while (millis() < timeout) {
         if (Serial1.available()) {
             char c = Serial1.read();
@@ -102,20 +96,18 @@ int wait_for_board(int expected) {
 }
 
 int do_end_turn(char *params) {
+    LOG_INFO("end turn, getting move from hall array");
     // just forward to M0
-    if (params)
-        SEND_CMD_P(CMD_END_TURN, "%s", params);
-    else
-        SEND_CMD(CMD_END_TURN);
+    SEND_CMD(CMD_END_TURN);
 
-    while (wait_for_board(CMD_STATUS) != STATUS_OKAY) {
-        if (params)
-            SEND_CMD_P(CMD_END_TURN, "%s", params);
-        else
-            SEND_CMD(CMD_END_TURN);
+    int status = wait_for_board(CMD_MOVE_PIECE, QUICK_TIMEOUT);
+    if (status == 99 || status == -1) { // try again
+        LOG_ERR("computing move failed, try again");
+        SEND_ANDROID_CMD(1);
+        return 0;
     }
 
-    waiting_for_user = false;
+    player_turn = false;
     return 0;
 }
 
@@ -141,7 +133,7 @@ int do_move_piece(char *params) {
         LOG_INFO("sending %s", params);
         SEND_CMD_P(CMD_MOVE_PIECE, "%s", params); // forward to M0
         while (1) {
-            int status = wait_for_board(CMD_STATUS);
+            int status = wait_for_board(CMD_STATUS, BOARD_TIMEOUT);
             LOG_TRACE("status=%d", status);
             if (status == STATUS_OKAY) {
                 break;
@@ -158,24 +150,20 @@ int do_move_piece(char *params) {
     } else {
         if (valid_move(params)) {
             if (http.ok(post_move(gid, pid, params))) {
+                LOG_INFO("Move posted okay: %s", response.body);
                 int err = 0;
                 json_scanf(response.body, strlen(response.body), "{err_code:%d}", &err);
-                if (err = 99) { // invalid move
-                    char undo_move[5];
-                    undo_move[0] = params[2];
-                    undo_move[1] = params[3];
-                    undo_move[2] = params[0];
-                    undo_move[3] = params[1];
-                    undo_move[0] = '\0';
-                    SEND_CMD_P(CMD_MOVE_PIECE, "%.4s", params);
+                if (err == 99) {
                     return err;
                 }
                 return 0;
             }
-            LOG_ERR("Failed to post move");
+            LOG_ERR("Failed to post move %s", params);
             return -1;
+        } else {
+            LOG_ERR("Invalid move format %s", params);
+            return 99;
         }
-        return 99;
     }
 }
 
@@ -202,33 +190,39 @@ int do_send_log(char *params) {
     int num_params = parse_params(params, p_arr, MAX_PARAMS);
     if (num_params != 1)
         return -1;
-    Logger m0_log("app.m0");
     int lvl = atoi(p_arr[0]);
     switch (lvl) {
         case LVL_TRACE:
-            m0_log.trace("%s", params+2);
+            MAIN_SERIAL.printf("[m0 trace] %s", params+2); MAIN_SERIAL.printf("\n");
             break;
         case LVL_INFO:
-            m0_log.info("%s", params+2);
+            MAIN_SERIAL.printf("[m0 info] %s", params+2); MAIN_SERIAL.printf("\n");
             break;
         case LVL_WARN:
-            m0_log.warn("%s", params+2);
+            MAIN_SERIAL.printf("[m0 warn] %s", params+2); MAIN_SERIAL.printf("\n");
             break;
         case LVL_ERR:
-            m0_log.error("%s", params+2);
+            MAIN_SERIAL.printf("[m0 error] %s", params+2); MAIN_SERIAL.printf("\n");
             break;
     }
     return 0;
 }
 
-int do_scan_wifi(char *params) {
-    LOG_TRACE("Serial scan wifi cmd not implemented");
-    return -1;
+// debug commands for photon and stm32
+int do_debug_cmd(char *params) {
+    if (params)
+        SEND_CMD_P(CMD_DEBUG, "%s", params);
+    else // default capture
+        SEND_CMD(CMD_DEBUG);
+    return 0;
 }
 
-int do_set_wifi(char *params) {
-    LOG_TRACE("Serial set wifi cmd not implemented");
-    return -1;
+int do_retry(char *params) {
+    SEND_CMD(CMD_RETRY);
+    if (wait_for_board(CMD_STATUS, QUICK_TIMEOUT) != STATUS_OKAY) {
+        LOG_ERR("retry failed");
+    }
+    return 0;
 }
 
 /*
@@ -236,10 +230,15 @@ int do_set_wifi(char *params) {
  */
 int do_capture_castle(char *params) {
     // just forward to M0
+    LOG_TRACE("capture castle, params=%s", params);
     if (params)
         SEND_CMD_P(CMD_CAPTURE_CASTLE, "%s", params);
     else // default capture
         SEND_CMD_P(CMD_CAPTURE_CASTLE, "%s", "c");
+
+    if (wait_for_board(CMD_STATUS, QUICK_TIMEOUT) != STATUS_OKAY) {
+        LOG_ERR("capture/castle failed");
+    }
     return 0;
 }
 
